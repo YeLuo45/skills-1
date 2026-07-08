@@ -25,8 +25,10 @@
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join, resolve, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
-import { execFileSync } from "node:child_process";
-import { parseArgs } from "node:util";
+import { execFile } from "node:child_process";
+import { parseArgs, promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -43,6 +45,10 @@ const { values: opts } = parseArgs({
     vally: { type: "string", default: "npx @microsoft/vally-cli" },
     model: { type: "string", default: "claude-opus-4.6" },
     "judge-model": { type: "string", default: "claude-opus-4.6" },
+    // How many `vally compare` invocations to run concurrently. Each compare is
+    // a judge (LLM) call, so raising this speeds up large merges at the cost of
+    // more concurrent backend sessions. Default 1 preserves serial behavior.
+    "compare-concurrency": { type: "string", default: "1" },
     help: { type: "boolean", default: false },
   },
   strict: true,
@@ -66,6 +72,7 @@ Options:
                             (default: "npx @microsoft/vally-cli")
   --judge-model <model>     Comparison judge model (default: claude-opus-4.6)
   --model <model>           Agent model, recorded on the verdict (default: claude-opus-4.6)
+  --compare-concurrency <n> Number of 'vally compare' calls to run at once (default: 1)
   --help                    Show this help`);
   process.exit(opts.help ? 0 : 1);
 }
@@ -135,7 +142,7 @@ function splitVallyCommand(cmd) {
  * Run `vally compare` in two-run mode over one eval's baseline vs skilled
  * slices and return the parsed comparison record (or null on failure).
  */
-function runCompare(baselineSlice, skilledSlice, outFile) {
+async function runCompare(baselineSlice, skilledSlice, outFile) {
   const { bin, prefix } = splitVallyCommand(opts.vally);
   const args = [
     ...prefix,
@@ -149,9 +156,26 @@ function runCompare(baselineSlice, skilledSlice, outFile) {
     "--output",
     outFile,
   ];
-  execFileSync(bin, args, { stdio: ["ignore", "ignore", "inherit"] });
+  await execFileAsync(bin, args, { maxBuffer: 64 * 1024 * 1024 });
   const records = loadJsonlFile(outFile);
   return records[0] ?? null;
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at a time.
+ * Results are returned in input order.
+ */
+async function runPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +266,15 @@ function main() {
   // surfaced rather than silently disappearing.
   const allEvals = [...new Set([...baselineByEval.keys(), ...skilledByEval.keys()])].sort();
 
+  const concurrency = Math.max(1, parseInt(opts["compare-concurrency"], 10) || 1);
   const workDir = mkdtempSync(join(tmpdir(), "vally-adapt-"));
   let written = 0;
   let incomplete = 0;
   try {
+    // Prepare one comparison task per eval that has both variants. Slice files
+    // are written synchronously up front; the compares themselves run through a
+    // bounded pool so we can parallelize the (LLM) judge calls.
+    const tasks = [];
     for (const evalFile of allEvals) {
       const { skill, plugin, skillPath } = evalIdentity(evalFile);
       const skilled = skilledByEval.get(evalFile) ?? [];
@@ -268,21 +297,25 @@ function main() {
       writeFileSync(baselineSlice, baseline.map((r) => JSON.stringify(r)).join("\n") + "\n");
       writeFileSync(skilledSlice, skilled.map((r) => JSON.stringify(r)).join("\n") + "\n");
 
+      tasks.push({ skill, plugin, skillPath, baselineSlice, skilledSlice, compareOut });
+    }
+
+    return runPool(tasks, concurrency, async (t) => {
       let report;
       try {
-        report = runCompare(baselineSlice, skilledSlice, compareOut);
+        report = await runCompare(t.baselineSlice, t.skilledSlice, t.compareOut);
       } catch (err) {
-        warn(`${plugin}/${skill}: vally compare failed — no verdict written (${err instanceof Error ? err.message : String(err)})`);
+        warn(`${t.plugin}/${t.skill}: vally compare failed — no verdict written (${err instanceof Error ? err.message : String(err)})`);
         incomplete++;
-        continue;
+        return;
       }
       if (!report) {
-        warn(`${plugin}/${skill}: vally compare produced no comparison record — no verdict written`);
+        warn(`${t.plugin}/${t.skill}: vally compare produced no comparison record — no verdict written`);
         incomplete++;
-        continue;
+        return;
       }
 
-      const verdict = comparisonToVerdict(report, { skill, plugin, skillPath });
+      const verdict = comparisonToVerdict(report, { skill: t.skill, plugin: t.plugin, skillPath: t.skillPath });
       const results = {
         model: opts.model,
         judgeModel: opts["judge-model"],
@@ -290,25 +323,25 @@ function main() {
         verdicts: [verdict],
       };
 
-      const evalOutDir = join(outputRoot, plugin, skill);
+      const evalOutDir = join(outputRoot, t.plugin, t.skill);
       mkdirSync(evalOutDir, { recursive: true });
       const outputPath = join(evalOutDir, "results.json");
       writeFileSync(outputPath, JSON.stringify(results, null, 2));
       written++;
 
       console.log(`\n${verdictSummaryLine(verdict)}\n  → ${outputPath}`);
-    }
-  } finally {
+    }).finally(() => {
+      rmSync(workDir, { recursive: true, force: true });
+      const incompleteNote = incomplete > 0 ? ` (${incomplete} eval(s) incomplete — see warnings above)` : "";
+      console.log(`\nWrote ${written} results.json file(s) under ${outputRoot}${incompleteNote}`);
+    });
+  } catch (err) {
     rmSync(workDir, { recursive: true, force: true });
+    throw err;
   }
-
-  const incompleteNote = incomplete > 0 ? ` (${incomplete} eval(s) incomplete — see warnings above)` : "";
-  console.log(`\nWrote ${written} results.json file(s) under ${outputRoot}${incompleteNote}`);
 }
 
-try {
-  main();
-} catch (err) {
+main().catch((err) => {
   console.error(`Error: ${err.message}`);
   process.exitCode = 1;
-}
+});

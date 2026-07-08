@@ -4,6 +4,18 @@
 # workflow_call, or can be triggered manually. Results are informational
 # only — they never gate PRs.
 #
+# Rate-limit strategy (why this workflow shards instead of matrixing per skill):
+# the discover job emits one entry per changed (plugin, skill), which on a
+# large PR is ~85+ entries. Fanning those out as one CI job each — every job
+# calling `vally experiment run --workers 5` — storms the Copilot backend from
+# only two tokens and trips rate limits. Instead we run a SINGLE vally
+# experiment across all targeted skills and split the work with vally's native
+# trial-level sharding (`vally experiment run --shard i/N --run-id <id>`), then
+# reconcile the shard outputs with `vally experiment merge`. Concurrency is
+# bounded by an adaptive shard count (<= MAX_SHARDS), the shard matrix'
+# max-parallel, and --workers per shard, so total concurrent Copilot sessions
+# stay small regardless of PR size.
+#
 # NOTE: This is a transitional workflow for the replat. It will be removed
 # once vally fully replaces skill-validator.
 name: vally-evaluation
@@ -38,45 +50,169 @@ env:
   # can't be parsed. The experiment file is the source of truth (see below).
   FALLBACK_MODEL: claude-opus-4.6
   FALLBACK_JUDGE_MODEL: claude-opus-4.6
+  # Concurrency budget. Peak concurrent Copilot sessions is roughly
+  # (shard matrix max-parallel) * WORKERS_PER_SHARD, spread across the
+  # available tokens. Adaptive shard count keeps small PRs cheap while capping
+  # large PRs at MAX_SHARDS.
+  MAX_SHARDS: '8'
+  EVALS_PER_SHARD: '8'
+  WORKERS_PER_SHARD: '5'
+  # How many `vally compare` judge calls the merge job runs at once when
+  # converting merged results into per-skill verdicts.
+  COMPARE_CONCURRENCY: '5'
 
 permissions:
   contents: read
 
 jobs:
   # --------------------------------------------------------------------------
-  # For workflow_dispatch: build a single-entry matrix
+  # Plan: turn the discover entries (or the dispatch inputs) into a single set
+  # of --eval-filter patterns, size the shard count from the eval total, and
+  # emit a stable run id shared by every shard.
   # --------------------------------------------------------------------------
-  prepare:
-    if: github.event_name == 'workflow_dispatch'
+  plan:
     runs-on: ubuntu-latest
     outputs:
-      entries: ${{ steps.build.outputs.entries }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+      shards: ${{ steps.plan.outputs.shards }}
+      filters_b64: ${{ steps.plan.outputs.filters_b64 }}
+      model: ${{ steps.plan.outputs.model }}
+      judge_model: ${{ steps.plan.outputs.judge_model }}
     steps:
-      - id: build
+      - name: Checkout skills content
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.head_sha || '' }}
+          persist-credentials: false
+
+      - name: Plan shards
+        id: plan
+        env:
+          ENTRIES: ${{ inputs.entries || '[]' }}
+          DISPATCH_PLUGIN: ${{ inputs.plugin }}
+          DISPATCH_SKILL: ${{ inputs.skill }}
         run: |
-          PLUGIN="${{ inputs.plugin }}"
-          SKILL="${{ inputs.skill }}"
-          if [ -n "$SKILL" ]; then
-            echo "entries=[{\"name\":\"${PLUGIN}--${SKILL}\",\"plugin\":\"${PLUGIN}\",\"skills_path\":\"plugins/${PLUGIN}/skills/${SKILL}\"}]" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          # Collect --eval-filter patterns. Each pattern is intersected by vally
+          # with the experiment's `evals:` glob, so `agent.*` skills (excluded
+          # from that glob) are dropped here to avoid a match-nothing hard error.
+          PATTERNS=()
+          add_skill_filter() {
+            case "$2" in
+              agent.*) return 0 ;;
+            esac
+            PATTERNS+=("tests/$1/$2/eval.vally.yaml")
+          }
+
+          if [ -n "$DISPATCH_PLUGIN" ]; then
+            if [ -n "$DISPATCH_SKILL" ]; then
+              add_skill_filter "$DISPATCH_PLUGIN" "$DISPATCH_SKILL"
+            else
+              PATTERNS+=("tests/$DISPATCH_PLUGIN/**/eval.vally.yaml")
+            fi
           else
-            echo "entries=[{\"name\":\"${PLUGIN}\",\"plugin\":\"${PLUGIN}\",\"skills_path\":\"plugins/${PLUGIN}/skills\"}]" >> $GITHUB_OUTPUT
+            # Expand every discover entry's skills_path token into a filter:
+            #   plugins/<plugin>/skills          -> tests/<plugin>/**   (whole plugin)
+            #   plugins/<plugin>/skills/<skill>  -> tests/<plugin>/<skill>
+            while IFS= read -r token; do
+              [ -n "$token" ] || continue
+              rel="${token#plugins/}"          # <plugin>/skills[/<skill>]
+              tp="${rel%%/skills*}"            # <plugin>
+              skill="${rel#*/skills}"          # "" or "/<skill>"
+              skill="${skill#/}"               # "" or "<skill>"
+              if [ -n "$skill" ]; then
+                add_skill_filter "$tp" "$skill"
+              else
+                PATTERNS+=("tests/$tp/**/eval.vally.yaml")
+              fi
+            done < <(printf '%s' "$ENTRIES" | jq -r '.[].skills_path // empty')
           fi
 
+          # Dedupe patterns.
+          if [ ${#PATTERNS[@]} -gt 0 ]; then
+            mapfile -t PATTERNS < <(printf '%s\n' "${PATTERNS[@]}" | awk 'NF' | sort -u)
+          fi
+
+          # Expand patterns to concrete, declared (non-agent) eval files purely
+          # to size the shard count.
+          FILES=()
+          for p in "${PATTERNS[@]:-}"; do
+            [ -n "$p" ] || continue
+            case "$p" in
+              *'**'*)
+                base="${p%%/'**'*}"          # tests/<plugin>
+                if [ -d "$base" ]; then
+                  while IFS= read -r f; do FILES+=("$f"); done \
+                    < <(find "$base" -type f -name 'eval.vally.yaml' | grep -v '/agent\.' || true)
+                fi
+                ;;
+              *)
+                [ -f "$p" ] && FILES+=("$p")
+                ;;
+            esac
+          done
+          if [ ${#FILES[@]} -gt 0 ]; then
+            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | awk 'NF' | sort -u)
+          fi
+          TOTAL=${#FILES[@]}
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "No vally evals matched — nothing to run."
+            exit 0
+          fi
+
+          # Adaptive shard count: ~EVALS_PER_SHARD evals per shard, capped at MAX_SHARDS.
+          N=$(( (TOTAL + EVALS_PER_SHARD - 1) / EVALS_PER_SHARD ))
+          [ "$N" -lt 1 ] && N=1
+          [ "$N" -gt "$MAX_SHARDS" ] && N="$MAX_SHARDS"
+
+          SHARDS=$(for i in $(seq 1 "$N"); do echo "$i/$N"; done | jq -R . | jq -sc .)
+          RUN_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+          FILTERS_B64=$(printf '%s\n' "${PATTERNS[@]}" | base64 -w0)
+
+          # Model + comparison-judge model come from the experiment file's
+          # `overrides:` block (single source of truth), matching run-vally-evals.sh.
+          read_override() {
+            awk -v k="$1" '
+              /^overrides:/ { f = 1; next }
+              /^[^[:space:]]/ { f = 0 }
+              f && $1 == k":" { print $2; exit }
+            ' dotnet-skills.experiment.yaml
+          }
+          MODEL="$(read_override model)"; MODEL="${MODEL:-$FALLBACK_MODEL}"
+          JUDGE_MODEL="$(read_override judge_model)"; JUDGE_MODEL="${JUDGE_MODEL:-$FALLBACK_JUDGE_MODEL}"
+
+          {
+            echo "has_work=true"
+            echo "run_id=$RUN_ID"
+            echo "shards=$SHARDS"
+            echo "filters_b64=$FILTERS_B64"
+            echo "model=$MODEL"
+            echo "judge_model=$JUDGE_MODEL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Planned $TOTAL eval(s) across $N shard(s); run_id=$RUN_ID"
+          printf 'Filters:\n%s\n' "$(printf '%s\n' "${PATTERNS[@]}")"
+
   # --------------------------------------------------------------------------
-  # Run vally evaluation (shadow mode)
+  # Shard: each job plans the whole experiment but executes only its trial
+  # slice (vally native --shard). max-parallel + --workers bound concurrency.
   # --------------------------------------------------------------------------
-  vally-evaluate:
-    needs: [prepare]
-    if: always() && !cancelled()
+  shard:
+    needs: [plan]
+    if: needs.plan.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     continue-on-error: true
-    name: vally (${{ matrix.entry.name }})
+    name: vally shard ${{ matrix.shard }}
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
-        entry: ${{ fromJson(inputs.entries || needs.prepare.outputs.entries || '[]') }}
-
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
     steps:
       - name: Checkout skills content
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -112,137 +248,168 @@ jobs:
           echo "::add-mask::${TOKENS[$IDX]}"
           echo "token=${TOKENS[$IDX]}" >> $GITHUB_OUTPUT
 
-      - name: Find eval specs
-        id: find-evals
-        env:
-          DISPATCH_SKILL: ${{ inputs.skill }}
-        run: |
-          # For workflow_dispatch targeting a specific skill, only run that one
-          # eval. Otherwise run every eval discovered under the plugin's tests
-          # directory.
-          if [ -n "$DISPATCH_SKILL" ]; then
-            CANDIDATE="tests/${{ matrix.entry.plugin }}/${DISPATCH_SKILL}/eval.vally.yaml"
-            if [ ! -f "$CANDIDATE" ]; then
-              echo "::error::workflow_dispatch requested skill '${DISPATCH_SKILL}' in plugin '${{ matrix.entry.plugin }}' but no eval spec exists at '${CANDIDATE}'. Check the skill name (case-sensitive) and that the eval file is present."
-              exit 1
-            fi
-            EVALS="$CANDIDATE"
-          else
-            EVALS=$(find tests/${{ matrix.entry.plugin }} -name "eval.vally.yaml" -type f | sort)
-          fi
-          if [ -z "$EVALS" ]; then
-            echo "No eval.vally.yaml files found for ${{ matrix.entry.plugin }}"
-            echo "has_evals=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_evals=true" >> $GITHUB_OUTPUT
-            echo "Found $(echo "$EVALS" | wc -l | tr -d ' ') eval specs"
-          fi
-
-      - name: Run vally evaluations
-        if: steps.find-evals.outputs.has_evals == 'true'
+      - name: Run vally shard
+        id: run
         env:
           GITHUB_TOKEN: ${{ steps.select-token.outputs.token }}
-          RESULTS_DIR: artifacts/TestResults/vally/${{ matrix.entry.name }}
+          RUN_ID: ${{ needs.plan.outputs.run_id }}
+          SHARD: ${{ matrix.shard }}
+          FILTERS_B64: ${{ needs.plan.outputs.filters_b64 }}
+          WORKERS: ${{ env.WORKERS_PER_SHARD }}
         run: |
-          PLUGIN="${{ matrix.entry.plugin }}"
-          SKILLS_PATH="${{ matrix.entry.skills_path }}"
-
-          # Scope the canonical experiment with --eval-filter (repeatable),
-          # which intersects each pattern with the experiment's `evals:` glob.
-          # `agent.*` evals are excluded by that glob, so they drop out
-          # automatically; a missing plugins/<plugin>/skills/<skill> dir surfaces
-          # as a skilled-variant failure that adapt.mjs warns on.
-          #
-          # Honor the matrix entry's skills_path so per-skill PR entries and
-          # sharded entries run only their targeted skills, not the whole plugin:
-          #   plugins/<plugin>/skills            -> tests/<plugin>/**   (whole plugin)
-          #   plugins/<plugin>/skills/<skill>    -> tests/<plugin>/<skill>
-          # A workflow_dispatch skill input overrides to that single skill.
+          set -uo pipefail
+          mapfile -t PATTERNS < <(printf '%s' "$FILTERS_B64" | base64 -d)
           FILTER_ARGS=()
-          if [ -n "${{ inputs.skill }}" ]; then
-            FILTER_ARGS=(--eval-filter "tests/$PLUGIN/${{ inputs.skill }}/eval.vally.yaml")
-          else
-            for token in $SKILLS_PATH; do
-              rel="${token#plugins/}"       # <plugin>/skills[/<skill>]
-              tp="${rel%%/skills*}"         # <plugin>
-              skill="${rel#*/skills}"       # "" or "/<skill>"
-              skill="${skill#/}"            # "" or "<skill>"
-              if [ -n "$skill" ]; then
-                FILTER_ARGS+=(--eval-filter "tests/$tp/$skill/eval.vally.yaml")
-              else
-                FILTER_ARGS+=(--eval-filter "tests/$tp/**/eval.vally.yaml")
-              fi
-            done
-          fi
-          if [ ${#FILTER_ARGS[@]} -eq 0 ]; then
-            FILTER_ARGS=(--eval-filter "tests/$PLUGIN/**/eval.vally.yaml")
-          fi
+          for p in "${PATTERNS[@]}"; do
+            [ -n "$p" ] && FILTER_ARGS+=(--eval-filter "$p")
+          done
 
-          # Model + comparison-judge model come from the experiment file's
-          # `overrides:` block (single source of truth), matching run-vally-evals.sh.
-          read_override() {
-            awk -v k="$1" '
-              /^overrides:/ { f = 1; next }
-              /^[^[:space:]]/ { f = 0 }
-              f && $1 == k":" { print $2; exit }
-            ' dotnet-skills.experiment.yaml
-          }
-          MODEL="$(read_override model)"; MODEL="${MODEL:-${{ env.FALLBACK_MODEL }}}"
-          JUDGE_MODEL="$(read_override judge_model)"; JUDGE_MODEL="${JUDGE_MODEL:-${{ env.FALLBACK_JUDGE_MODEL }}}"
-
-          # Run baseline (no skills) + skilled (the one skill) in a single
-          # experiment pass. The baseline is a true skill-free control because
-          # vally does no ambient skill discovery — skills load only from
-          # environment.skills.
-          EXPERIMENT_OUT="$RESULTS_DIR/_experiment"
-          mkdir -p "$EXPERIMENT_OUT"
+          mkdir -p out
           vally experiment run dotnet-skills.experiment.yaml \
             "${FILTER_ARGS[@]}" \
-            --output-dir "$EXPERIMENT_OUT" \
-            --workers 5 \
-            2>&1 || echo "::warning::vally experiment run reported failures for $PLUGIN"
+            --run-id "$RUN_ID" \
+            --shard "$SHARD" \
+            --workers "$WORKERS" \
+            --output-dir "$PWD/out" \
+            2>&1 || echo "::warning::vally experiment run reported failures for shard $SHARD"
 
-          RUN_DIR=$(find "$EXPERIMENT_OUT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
-          if [ -z "$RUN_DIR" ]; then
-            echo "::warning::No experiment output produced for $PLUGIN"
+          SHARD_DIR=$(find "out/$RUN_ID" -mindepth 1 -maxdepth 1 -type d -name 'shard-*-of-*' | sort | head -1)
+          if [ -z "$SHARD_DIR" ]; then
+            echo "::error::shard $SHARD produced no output directory under out/$RUN_ID"
+            exit 1
+          fi
+          echo "shard_dir=$SHARD_DIR" >> "$GITHUB_OUTPUT"
+          echo "Shard $SHARD output: $SHARD_DIR"
+
+      - name: Upload shard output
+        if: always() && steps.run.outputs.shard_dir != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vally-shard-${{ strategy.job-index }}
+          path: ${{ steps.run.outputs.shard_dir }}
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Merge: reconcile shard outputs with `vally experiment merge`, then run the
+  # adapter to produce per-skill verdicts and the shadow summary.
+  # --------------------------------------------------------------------------
+  merge:
+    needs: [plan, shard]
+    if: always() && !cancelled() && needs.plan.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - name: Checkout skills content
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.head_sha || '' }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+
+      - name: Install vally
+        run: npm install -g @microsoft/vally-cli
+
+      - name: Select Copilot token
+        id: select-token
+        env:
+          TOKEN_1: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          TOKEN_2: ${{ secrets.COPILOT_GITHUB_TOKEN_2 }}
+        run: |
+          TOKENS=()
+          for i in 1 2; do
+            var="TOKEN_$i"
+            val="${!var}"
+            if [ -n "$val" ]; then TOKENS+=("$val"); fi
+          done
+          if [ ${#TOKENS[@]} -eq 0 ]; then
+            echo "::error::No COPILOT_GITHUB_TOKEN secrets are configured"
+            exit 1
+          fi
+          IDX=$(( ${RANDOM} % ${#TOKENS[@]} ))
+          echo "::add-mask::${TOKENS[$IDX]}"
+          echo "token=${TOKENS[$IDX]}" >> $GITHUB_OUTPUT
+
+      - name: Download shard outputs
+        uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v8
+        with:
+          pattern: vally-shard-*
+          path: shards
+
+      - name: Merge and adapt
+        id: merge
+        env:
+          GITHUB_TOKEN: ${{ steps.select-token.outputs.token }}
+          MODEL: ${{ needs.plan.outputs.model }}
+          JUDGE_MODEL: ${{ needs.plan.outputs.judge_model }}
+          COMPARE_CONCURRENCY: ${{ env.COMPARE_CONCURRENCY }}
+          RESULTS_DIR: artifacts/TestResults/vally
+        run: |
+          set -uo pipefail
+
+          SHARD_DIRS=()
+          while IFS= read -r d; do SHARD_DIRS+=("$d"); done \
+            < <(find shards -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ ${#SHARD_DIRS[@]} -eq 0 ]; then
+            echo "::warning::No shard artifacts were downloaded — nothing to merge."
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Merging ${#SHARD_DIRS[@]} shard(s):"
+          printf '  %s\n' "${SHARD_DIRS[@]}"
+
+          vally experiment merge "${SHARD_DIRS[@]}" -o merged \
+            2>&1 || echo "::warning::vally experiment merge reported variant failures"
+
+          if ! find merged -name 'results.jsonl' | grep -q .; then
+            echo "::warning::merge produced no results.jsonl — skilled/baseline runs failed to validate (see shard logs)"
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Split the per-variant experiment output by eval and run `vally
-          # compare` per skill (in the adapter) to produce the per-skill
-          # results.json the shadow summary consumes. `vally` is on PATH here.
+          # Split the merged per-variant output by eval and run `vally compare`
+          # per skill (in the adapter) to produce the per-skill results.json the
+          # shadow summary consumes. `vally` is on PATH here.
           node eng/vally-adapter/adapt.mjs \
-            --experiment-dir "$RUN_DIR" \
+            --experiment-dir merged \
             --output-root "$RESULTS_DIR" \
             --vally "vally" \
             --model "$MODEL" \
-            --judge-model "$JUDGE_MODEL"
+            --judge-model "$JUDGE_MODEL" \
+            --compare-concurrency "$COMPARE_CONCURRENCY"
 
-          # Informational shadow job: surface how many verdicts were produced.
-          PRODUCED=$(find "$RESULTS_DIR" -name results.json -not -path "$EXPERIMENT_OUT/*" | wc -l | tr -d ' ')
-          echo "Produced $PRODUCED skill verdict(s) for $PLUGIN"
+          PRODUCED=$(find "$RESULTS_DIR" -name results.json | wc -l | tr -d ' ')
+          echo "Produced $PRODUCED skill verdict(s)"
+          echo "has_results=true" >> "$GITHUB_OUTPUT"
           if [ "$PRODUCED" -eq 0 ]; then
-            echo "::warning::vally produced no skill verdicts for $PLUGIN — evals failed to run or validate (see logs above)"
+            echo "::warning::vally produced no skill verdicts — evals failed to run or validate (see logs above)"
           fi
 
       - name: Upload results
-        if: always() && steps.find-evals.outputs.has_evals == 'true'
+        if: always() && steps.merge.outputs.has_results == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: vally-results-${{ matrix.entry.name }}
-          path: artifacts/TestResults/vally/${{ matrix.entry.name }}/
+          name: vally-results
+          path: artifacts/TestResults/vally/
           include-hidden-files: true
           retention-days: 14
+          if-no-files-found: warn
 
       - name: Write summary
-        if: always() && steps.find-evals.outputs.has_evals == 'true'
+        if: always() && steps.merge.outputs.has_results == 'true'
         run: |
-          echo "## 🔬 Vally Shadow Results: ${{ matrix.entry.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔬 Vally Shadow Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Skilled vs baseline, judged head-to-head by \`vally compare\`. A skill passes only on a credible improvement (mean preference > 0 with its 95% CI above 0)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          RESULTS_DIR="artifacts/TestResults/vally/${{ matrix.entry.name }}"
+          RESULTS_DIR="artifacts/TestResults/vally"
           while IFS= read -r RESULTS_JSON; do
             if [ ! -f "$RESULTS_JSON" ]; then continue; fi
             EVAL_NAME=$(basename $(dirname "$RESULTS_JSON"))
